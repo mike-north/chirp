@@ -19,18 +19,26 @@
 //     ▼                │ error  │
 //   ┌───────┐  retry   └────────┘
 //   │ ready │←────────────┘
-//   └───┬───┘←──────────────────────────────────┐
-//  fn press│                                ESC │
-//        ▼                                      │
-//   ┌───────────┐  fn release  ┌──────────────┐ │
-//   │ recording ├─────────────→│ transcribing ├─┘
-//   └─────┬─────┘  ←───────────┴──────┬───────┘
-//      ESC│         fn press          │ flush + linger
-//         └──→ ready                  └──→ ready
+//   └───┬───┘←─────────────────────────────────────────┐
+//  fn press│                                       ESC │
+//        ▼                                             │
+//   ┌───────────┐  fn release  ┌──────────────┐       │
+//   │ recording ├─────────────→│ transcribing │       │
+//   └─────┬─────┘  ←───────────┴──────┬───────┘       │
+//      ESC│         fn press          │               │
+//         │                            ▼               │
+//         │                  (if refine enabled)       │
+//         │                     ┌──────────┐           │
+//         │                     │ refining │───────────┤
+//         │                     └────┬─────┘           │
+//         │                    done  │                 │
+//         │                          ▼                 │
+//         └──→ ready ←──────── linger / done ──────────┘
 //
 // recording ↔ transcribing can cycle (fn press/release) within the
-// same session. Text accumulates across cycles. Session ends via
-// linger timeout (natural) or ESC (cancel).
+// same session. Text accumulates across cycles. If refine is enabled,
+// after flush the state transitions to .refining, then back to .ready
+// after linger. Session ends via linger timeout (natural) or ESC (cancel).
 
 import SwiftUI
 import Foundation
@@ -47,6 +55,7 @@ public final class AppState {
         case ready
         case recording
         case transcribing
+        case refining
         case error(String)
     }
 
@@ -87,11 +96,21 @@ public final class AppState {
     /// Peek previews that were started before the latest commit are discarded.
     private var commitGen = 0
 
+    public var claudeRefineConfig = ClaudeRefineConfig()
+    public var textRefiner: (any TextRefining)?
+    public var daemonManager: DaemonManager?
+
     public convenience init() {
         self.init(audioRecorder: AudioRecorder(), transcriber: Transcriber(), textInserter: TextInserter())
         self.modelFileCheck = { [weak self] in
             guard let self else { return false }
             return ModelManager.findExisting(variant: self.activeVariant) != nil
+        }
+        let dm = DaemonManager()
+        self.daemonManager = dm
+        self.textRefiner = ClaudeTextRefiner()
+        if claudeRefineConfig.enabled {
+            dm.start()
         }
     }
 
@@ -365,6 +384,10 @@ public final class AppState {
         }
 
         let transcriber = self.transcriber
+        // Capture config at session start so it stays consistent throughout
+        // the consumer task (also avoids re-reading UserDefaults mid-session).
+        let refineEnabled = self.claudeRefineConfig.enabled
+        let refinePrompt = self.claudeRefineConfig.prompt
         audioConsumerTask = Task { [weak self] in
             // Guaranteed to run before first feedAudio — no ordering race.
             await transcriber.resetVAD()
@@ -391,7 +414,9 @@ public final class AppState {
                     let needsSpace = !self.transcribedText.isEmpty
                     if needsSpace { self.transcribedText += " " }
                     self.transcribedText += text
-                    self.textInserter.typeText(needsSpace ? " \(text)" : text)
+                    if !refineEnabled {
+                        self.textInserter.typeText(needsSpace ? " \(text)" : text)
+                    }
                 }
             }
 
@@ -408,10 +433,41 @@ public final class AppState {
                 let needsSpace = !self.transcribedText.isEmpty
                 if needsSpace { self.transcribedText += " " }
                 self.transcribedText += remaining
-                self.textInserter.typeText(needsSpace ? " \(remaining)" : remaining)
+                if !refineEnabled {
+                    self.textInserter.typeText(needsSpace ? " \(remaining)" : remaining)
+                }
             }
             self.audioLevel = 0
             self.hotkeyManager?.sessionActive = false
+
+            // Refinement flow: if enabled, send accumulated text to Claude for cleanup
+            // before typing it out. Falls back to raw text if refiner unavailable or throws.
+            if refineEnabled && !self.transcribedText.isEmpty,
+               let refiner = self.textRefiner {
+                self.status = .refining
+                do {
+                    let refined = try await refiner.refine(
+                        text: self.transcribedText,
+                        systemPrompt: refinePrompt
+                    )
+                    guard !Task.isCancelled else { return }
+                    guard self.recordingSession == session else { return }
+                    if refined.isEmpty {
+                        self.textInserter.typeText(self.transcribedText)
+                    } else {
+                        self.textInserter.typeText(refined)
+                        self.transcribedText = refined
+                    }
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    guard self.recordingSession == session else { return }
+                    self.textInserter.typeText(self.transcribedText)
+                }
+            } else if refineEnabled && !self.transcribedText.isEmpty {
+                // Refiner not available — fall back to raw text
+                self.textInserter.typeText(self.transcribedText)
+            }
+
             if !self.transcribedText.isEmpty {
                 try? await Task.sleep(nanoseconds: self.lingerDuration)
                 guard !Task.isCancelled else { return }
@@ -461,7 +517,7 @@ public final class AppState {
 
     func cancelSession() {
         switch status {
-        case .recording, .transcribing: break
+        case .recording, .transcribing, .refining: break
         default: return
         }
 

@@ -35,3 +35,15 @@ extension AudioRecording {
     func typeText(_ text: String)
     func deleteBackward(count: Int)
 }
+
+/// Abstraction for post-transcription text refinement (e.g., grammar, punctuation, filler word removal).
+/// Implementations send transcribed text to an LLM or other service for cleanup before insertion.
+@MainActor public protocol TextRefining {
+    /// Refines raw transcribed text using the provided system prompt.
+    /// - Parameters:
+    ///   - text: Raw transcription output.
+    ///   - systemPrompt: Instructions for how to refine the text.
+    /// - Returns: Cleaned-up text with corrected grammar, punctuation, etc.
+    /// - Throws: If refinement fails (network, parsing, or service errors).
+    func refine(text: String, systemPrompt: String) async throws -> String
+}

@@ -27,6 +27,7 @@ struct ChirpApp: App {
             VStack(spacing: 0) {
                 modelSection
                 hotkeySection
+                claudeSection
                 CheckForUpdatesView(updater: updaterController.updater)
 
                 SectionDivider()
@@ -200,6 +201,131 @@ struct ChirpApp: App {
                 .font(.system(size: 10))
                 .foregroundColor(.white.opacity(0.2))
         }
+    }
+
+    // MARK: - Claude Refinement Section
+
+    @State private var showPromptEditor = false
+
+    @ViewBuilder
+    private var claudeSection: some View {
+        Text("Claude Refinement")
+            .font(.system(size: 13, weight: .medium))
+            .foregroundColor(.white.opacity(0.7))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+
+        Toggle(isOn: claudeEnabledBinding) {
+            Text("Refine with Claude")
+                .font(.system(size: 13))
+                .foregroundColor(.white.opacity(0.7))
+        }
+        .toggleStyle(.switch)
+        .controlSize(.small)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+
+        if appState.claudeRefineConfig.enabled {
+            // Model picker
+            Picker("Model", selection: claudeModelBinding) {
+                Text("Sonnet 4.5").tag("claude-sonnet-4-5-20250929")
+                Text("Haiku 4.5").tag("claude-haiku-4-5-20251001")
+            }
+            .pickerStyle(.menu)
+            .font(.system(size: 11))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 2)
+
+            // Edit prompt button
+            Button {
+                showPromptEditor.toggle()
+            } label: {
+                HStack {
+                    Text("Edit Prompt\u{2026}")
+                        .font(.system(size: 11))
+                        .foregroundColor(.white.opacity(0.5))
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
+            }
+            .buttonStyle(MenuRowStyle())
+
+            if showPromptEditor {
+                TextEditor(text: claudePromptBinding)
+                    .font(.system(size: 10))
+                    .frame(height: 80)
+                    .scrollContentBackground(.hidden)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(.white.opacity(0.06))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(.white.opacity(0.1), lineWidth: 0.5)
+                    )
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 4)
+            }
+
+            // Daemon status indicator
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(daemonStatusColor)
+                    .frame(width: 6, height: 6)
+                Text(daemonStatusLabel)
+                    .font(.system(size: 10))
+                    .foregroundColor(.white.opacity(0.35))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 4)
+        }
+
+        SectionDivider()
+    }
+
+    private var claudeEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { appState.claudeRefineConfig.enabled },
+            set: { newValue in
+                appState.claudeRefineConfig.enabled = newValue
+                if newValue {
+                    appState.daemonManager?.start()
+                } else {
+                    appState.daemonManager?.stop()
+                }
+            }
+        )
+    }
+
+    private var claudeModelBinding: Binding<String> {
+        Binding(
+            get: { appState.claudeRefineConfig.model },
+            set: { appState.claudeRefineConfig.model = $0 }
+        )
+    }
+
+    private var claudePromptBinding: Binding<String> {
+        Binding(
+            get: { appState.claudeRefineConfig.prompt },
+            set: { appState.claudeRefineConfig.prompt = $0 }
+        )
+    }
+
+    private var daemonStatusColor: Color {
+        guard let dm = appState.daemonManager else { return .gray }
+        if dm.isReady { return .green }
+        if dm.nodeAvailable { return .red }
+        return .gray
+    }
+
+    private var daemonStatusLabel: String {
+        guard let dm = appState.daemonManager else { return "Daemon not initialized" }
+        if dm.isReady { return "Daemon ready" }
+        if dm.nodeAvailable { return dm.lastError ?? "Daemon not ready" }
+        return "Node.js not found"
     }
 
     // MARK: - Hotkey Section

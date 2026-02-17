@@ -18,8 +18,16 @@ hotkey press/release          microphone
                         ▼
                 TextPostProcessor
                         │
-                        ▼
+                        ▼ (if refine disabled)
                   TextInserter ──→ keystrokes into focused app
+                        ▲
+                        │ (if refine enabled)
+                ClaudeTextRefiner ──→ Unix socket ──→ chirp-daemon
+                                                      (Node.js)
+                                                         │
+                                                    Claude Code SDK
+                                                         │
+                                                    Anthropic API
 ```
 
 **AppState** orchestrates everything. **ModelManager** handles first-run model download. All speech inference runs through the **CSherpaOnnx** C bridge to sherpa-onnx + onnxruntime dylibs.
@@ -48,15 +56,22 @@ hotkey press/release          microphone
   ┌───────────┐  fn release  ┌──────────────┐ │
   │ recording ├─────────────→│ transcribing ├─┘
   └─────┬─────┘  ←───────────┴──────┬───────┘
-     ESC│         fn press          │ flush + linger
-        └──→ ready                  └──→ ready
+     ESC│         fn press          │ flush
+        └──→ ready                  │
+                          ┌─────────┘
+                          ▼ (refine enabled?)
+                    ┌───────────┐
+                    │ refining  │──→ linger ──→ ready
+                    └─────┬─────┘
+                       ESC│
+                          └──→ ready
 
   ready ──(fn press, model missing)──→ downloading
 ```
 
-AppState owns all transitions. User-initiated transitions: `ready → recording` (fn press), `recording → transcribing` (fn release), `recording/transcribing → ready` (ESC cancel), and `transcribing → recording` (fn press rejoin). The rest are automatic.
+AppState owns all transitions. User-initiated transitions: `ready → recording` (fn press), `recording → transcribing` (fn release), `recording/transcribing/refining → ready` (ESC cancel), and `transcribing → recording` (fn press rejoin). The rest are automatic.
 
-**Recording sessions**: `recording ↔ transcribing` can cycle via fn press/release within the same session — text accumulates across cycles. A session ends naturally (flush + linger timeout) or immediately via ESC cancel. Cancel clears all accumulated text and hides the overlay; already-typed keystrokes are not undone.
+**Recording sessions**: `recording ↔ transcribing` can cycle via fn press/release within the same session — text accumulates across cycles. A session ends naturally (flush + optional refine + linger timeout) or immediately via ESC cancel. Cancel clears all accumulated text and hides the overlay; already-typed keystrokes are not undone.
 
 Cancelling a download transitions to `needsModel` (clean idle state); from there, pressing fn or selecting a model from the menu re-enters `downloading`. If model files disappear after reaching `ready`, pressing fn re-triggers the download/load flow instead of recording. Pressing fn during `downloading` or `loadingModel` triggers a brief scale-pulse nudge on the overlay (via `downloadNudge`) instead of silently ignoring the press.
 
@@ -120,9 +135,21 @@ Silero VAD is bundled in the app; only the ASR model is downloaded at runtime. F
 - Conic gradient glow border (active during recording, transcribing, and download)
 - Catppuccin-inspired color palette
 
+## Claude Refinement (Optional)
+
+When enabled, transcription text is sent to the Anthropic API for grammar/punctuation cleanup before typing. This is implemented as a sidecar Node.js daemon communicating over a Unix domain socket.
+
+**ClaudeTextRefiner** (`TextRefining` protocol) connects to `/tmp/chirp-claude.sock` and sends newline-delimited JSON requests. The response is either the refined text or an error — on any failure, the raw transcription is typed as a fallback. Safety guards: 1MB response size cap and total request timeout.
+
+**DaemonManager** spawns and monitors the `chirp-daemon` Node.js process. It polls for socket creation (100×100ms = 10s timeout), auto-restarts on crash with exponential backoff (1s, 2s, 4s, 8s, 16s, capped at 30s), and terminates the daemon on app quit.
+
+**chirp-daemon** (`chirp-daemon/src/index.ts`) is a Node.js server that listens on the Unix socket and calls the `@anthropic-ai/claude-code` SDK's `query()` function. Socket permissions are set to 0600 (owner-only).
+
+Config (`ClaudeRefineConfig`) is stored in UserDefaults: enable/disable toggle, model selection (Sonnet/Haiku), and customizable system prompt. Config is captured at session start so changes don't affect in-flight sessions. See `docs/claude-refinement.md` for the full protocol spec and development setup.
+
 ## Testing
 
-Protocol-based DI (`TranscriberProtocol`, `AudioRecording`, `TextInserting`) enables testing without hardware or ML models. Mock implementations live in `Tests/ChirpTests/Mocks.swift`. Tests use Swift Testing framework.
+Protocol-based DI (`TranscriberProtocol`, `AudioRecording`, `TextInserting`, `TextRefining`) enables testing without hardware, ML models, or API access. Mock implementations live in `Tests/ChirpTests/Mocks.swift`. Tests use Swift Testing framework.
 
 ## Build & Distribution
 
@@ -137,6 +164,7 @@ Protocol-based DI (`TranscriberProtocol`, `AudioRecording`, `TextInserting`) ena
 
 `scripts/package.sh` creates a signed `.app` bundle + DMG:
 - Copies dylibs to `Frameworks/`, fixes rpaths to `@executable_path/../Frameworks`
+- Builds and bundles `chirp-daemon` (dist + prod-only node_modules) into `Contents/Resources/chirp-daemon`
 - Code-signs with hardened runtime
 - Entitlements: microphone access, library validation disabled (for unsigned dylibs)
 - `Info.plist` sets `LSUIElement: true` (no dock icon)
@@ -149,7 +177,7 @@ Protocol-based DI (`TranscriberProtocol`, `AudioRecording`, `TextInserting`) ena
 |------|---------|
 | `ChirpApp.swift` | AppState state machine (public API for cross-module access) |
 | `Main.swift` | `@main` SwiftUI app entry point (window-style menu bar popover, Catppuccin theme) |
-| `Protocols.swift` | DI boundaries: TranscriberProtocol, AudioRecording, TextInserting |
+| `Protocols.swift` | DI boundaries: TranscriberProtocol, AudioRecording, TextInserting, TextRefining |
 | `Transcriber.swift` | Actor wrapping sherpa-onnx offline recognizer + VAD |
 | `AudioRecorder.swift` | AVAudioEngine mic capture with sample-rate conversion |
 | `TextInserter.swift` | CGEvent keyboard simulation |
@@ -159,3 +187,7 @@ Protocol-based DI (`TranscriberProtocol`, `AudioRecording`, `TextInserting`) ena
 | `OverlayPanel.swift` | Floating waveform HUD |
 | `ModelManager.swift` | Model download, extraction, discovery |
 | `ModelVariant.swift` | Model metadata enum with persistence |
+| `ClaudeTextRefiner.swift` | Unix socket client for Claude refinement daemon |
+| `DaemonManager.swift` | Node.js sidecar process lifecycle management |
+| `chirp-daemon/src/index.ts` | TypeScript daemon: Unix socket server → Claude Code SDK |
+| `docs/claude-refinement.md` | Detailed refinement architecture documentation |
