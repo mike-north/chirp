@@ -68,6 +68,15 @@ main() {
     stamp_version "$contents/Info.plist" "$version" "$build_number"
     echo "    Version: $version (build $build_number)"
 
+    # ── Build and bundle TypeScript daemon ──
+    echo "==> Building chirp-daemon..."
+    (cd "$root/chirp-daemon" && pnpm install --frozen-lockfile && pnpm run build && pnpm prune --prod)
+    local daemon_dest="$contents/Resources/chirp-daemon"
+    mkdir -p "$daemon_dest"
+    cp -R "$root/chirp-daemon/dist" "$daemon_dest/dist"
+    cp -R "$root/chirp-daemon/node_modules" "$daemon_dest/node_modules"
+    cp "$root/chirp-daemon/package.json" "$daemon_dest/package.json"
+
     # Copy entitlements (needed for signing step)
     local entitlements="$root/Sources/Chirp/Chirp.entitlements"
 

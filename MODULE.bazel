@@ -7,7 +7,23 @@ bazel_dep(name = "apple_support", version = "2.2.0")
 bazel_dep(name = "rules_cc", version = "0.2.16")
 bazel_dep(name = "rules_swift", version = "3.4.2")
 bazel_dep(name = "rules_apple", version = "4.3.3")
+bazel_dep(name = "rules_swift_package_manager", version = "1.12.0")
 
 # --- External dependencies (sherpa-onnx, Sparkle, Silero VAD) ---
 deps = use_extension("//:deps.bzl", "deps")
-use_repo(deps, "sherpa_onnx", "sparkle", "silero_vad")
+use_repo(deps, "sherpa_onnx", "silero_vad", "sparkle")
+
+# --- Swift Package Manager dependencies ---
+swift_deps = use_extension(
+    "@rules_swift_package_manager//:extensions.bzl",
+    "swift_deps",
+)
+swift_deps.from_package(
+    resolved = "//:Package.resolved",
+    swift = "//:Package.swift",
+)
+use_repo(
+    swift_deps,
+    "swift_package",
+    "swiftpkg_swift_transformers",
+)

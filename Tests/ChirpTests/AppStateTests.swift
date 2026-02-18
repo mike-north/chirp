@@ -10,6 +10,7 @@ struct AppStateTests {
         transcriber: MockTranscriber = MockTranscriber(),
         recorder: MockAudioRecorder = MockAudioRecorder(),
         inserter: MockTextInserter = MockTextInserter(),
+        refiner: MockTextRefiner? = nil,
         modelFileCheck: @escaping () -> Bool = { true }
     ) -> (AppState, MockTranscriber, MockAudioRecorder, MockTextInserter) {
         let state = AppState(
@@ -20,6 +21,13 @@ struct AppStateTests {
         )
         state.modelFileCheck = modelFileCheck
         state.lingerDuration = 1_000_000 // 1ms — don't slow down tests
+        // Reset UserDefaults-backed config to prevent cross-test pollution.
+        // Config is captured at startRecording() time, so tests that need
+        // enabled=true can set it after makeAppState returns.
+        state.refinementProvider = .none
+        if let refiner {
+            state.textRefiner = refiner
+        }
         return (state, transcriber, recorder, inserter)
     }
 
@@ -1179,6 +1187,388 @@ struct AppStateTests {
         }
         #expect(state.transcribedText == "Hi")
         #expect(recorder.isRecording)
+    }
+
+    // MARK: - Claude refinement
+
+    @Test("Refine enabled + success types only refined text")
+    func refineEnabledSuccess() async throws {
+        let mock = MockTranscriber()
+        await mock.setFeedAudioResult(["hello world"])
+        await mock.setFlushResult("")
+        let recorder = MockAudioRecorder()
+        let inserter = MockTextInserter()
+        let refiner = MockTextRefiner()
+        refiner.refineResult = "Hello, world!"
+        let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
+        state.refinementProvider = .claude
+
+        state.status = .ready
+        state.startRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if await mock.resetVADCalled { break }
+        }
+
+        recorder.lastOnSamples?([0.1])
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if !state.transcribedText.isEmpty { break }
+        }
+
+        state.stopRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if case .ready = state.status { break }
+        }
+
+        #expect(refiner.refineCalled)
+        #expect(inserter.typedTexts == ["Hello, world!"])
+        #expect(state.transcribedText == "Hello, world!")
+    }
+
+    @Test("Refine enabled + failure falls back to raw text")
+    func refineEnabledFailure() async throws {
+        let mock = MockTranscriber()
+        await mock.setFeedAudioResult(["hello world"])
+        await mock.setFlushResult("")
+        let recorder = MockAudioRecorder()
+        let inserter = MockTextInserter()
+        let refiner = MockTextRefiner()
+        refiner.refineError = RefineError.connectionFailed(errno: 61)
+        let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
+        state.refinementProvider = .claude
+
+        state.status = .ready
+        state.startRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if await mock.resetVADCalled { break }
+        }
+
+        recorder.lastOnSamples?([0.1])
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if !state.transcribedText.isEmpty { break }
+        }
+
+        state.stopRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if case .ready = state.status { break }
+        }
+
+        #expect(refiner.refineCalled)
+        // Fallback: raw text typed
+        #expect(inserter.typedTexts == ["hello world"])
+    }
+
+    @Test("Refine disabled types per-segment and never calls refiner")
+    func refineDisabled() async throws {
+        let mock = MockTranscriber()
+        await mock.setFeedAudioResult(["hello"])
+        await mock.setFlushResult("world")
+        let recorder = MockAudioRecorder()
+        let inserter = MockTextInserter()
+        let refiner = MockTextRefiner()
+        let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
+        state.refinementProvider = .none
+
+        state.status = .ready
+        state.startRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if await mock.resetVADCalled { break }
+        }
+
+        recorder.lastOnSamples?([0.1])
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if !state.transcribedText.isEmpty { break }
+        }
+
+        state.stopRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if case .ready = state.status { break }
+        }
+
+        #expect(!refiner.refineCalled)
+        #expect(inserter.typedTexts == ["hello", " world"])
+    }
+
+    @Test("Cancel during refining prevents text from being typed")
+    func cancelDuringRefining() async throws {
+        let mock = MockTranscriber()
+        await mock.setFeedAudioResult(["hello"])
+        await mock.setFlushResult("")
+        let recorder = MockAudioRecorder()
+        let inserter = MockTextInserter()
+        let refiner = MockTextRefiner()
+        refiner.refineResult = "refined"
+        refiner.refineDelay = .seconds(5)
+        let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
+        state.refinementProvider = .claude
+
+        state.status = .ready
+        state.startRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if await mock.resetVADCalled { break }
+        }
+
+        recorder.lastOnSamples?([0.1])
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if !state.transcribedText.isEmpty { break }
+        }
+
+        state.stopRecording()
+
+        // Wait for refining state
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if case .refining = state.status { break }
+        }
+
+        state.cancelSession()
+
+        guard case .ready = state.status else {
+            Issue.record("Expected .ready after cancel, got \(state.status)")
+            return
+        }
+
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(inserter.typedTexts.isEmpty)
+    }
+
+    @Test("Empty text after flush does not call refiner")
+    func emptyTextSkipsRefine() async throws {
+        let mock = MockTranscriber()
+        await mock.setFlushResult("")
+        let recorder = MockAudioRecorder()
+        let inserter = MockTextInserter()
+        let refiner = MockTextRefiner()
+        refiner.refineResult = "should not appear"
+        let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
+        state.refinementProvider = .claude
+
+        state.status = .ready
+        state.startRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if await mock.resetVADCalled { break }
+        }
+
+        state.stopRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if case .ready = state.status { break }
+        }
+
+        #expect(!refiner.refineCalled)
+        #expect(inserter.typedTexts.isEmpty)
+    }
+
+    @Test("Refiner returns empty string falls back to raw text")
+    func refineReturnsEmptyFallbackToRaw() async throws {
+        let mock = MockTranscriber()
+        await mock.setFeedAudioResult(["hello world"])
+        await mock.setFlushResult("")
+        let recorder = MockAudioRecorder()
+        let inserter = MockTextInserter()
+        let refiner = MockTextRefiner()
+        refiner.refineResult = ""
+        let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
+        state.refinementProvider = .claude
+
+        state.status = .ready
+        state.startRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if await mock.resetVADCalled { break }
+        }
+
+        recorder.lastOnSamples?([0.1])
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if !state.transcribedText.isEmpty { break }
+        }
+
+        state.stopRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if case .ready = state.status { break }
+        }
+
+        #expect(refiner.refineCalled)
+        #expect(inserter.typedTexts == ["hello world"])
+        #expect(state.transcribedText == "hello world")
+    }
+
+    @Test("Refiner nil but enabled falls back to raw text")
+    func refinerNilEnabledFallbackToRaw() async throws {
+        let mock = MockTranscriber()
+        await mock.setFeedAudioResult(["hello"])
+        await mock.setFlushResult("")
+        let recorder = MockAudioRecorder()
+        let inserter = MockTextInserter()
+        // No refiner passed — remains nil
+        let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter)
+        state.refinementProvider = .claude
+
+        state.status = .ready
+        state.startRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if await mock.resetVADCalled { break }
+        }
+
+        recorder.lastOnSamples?([0.1])
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if !state.transcribedText.isEmpty { break }
+        }
+
+        state.stopRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if case .ready = state.status { break }
+        }
+
+        #expect(inserter.typedTexts == ["hello"])
+    }
+
+    @Test("T5 provider enabled + success types only refined text")
+    func t5ProviderSuccess() async throws {
+        let mock = MockTranscriber()
+        await mock.setFeedAudioResult(["hello world"])
+        await mock.setFlushResult("")
+        let recorder = MockAudioRecorder()
+        let inserter = MockTextInserter()
+        let refiner = MockTextRefiner()
+        refiner.refineResult = "Hello, world!"
+        let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
+        state.refinementProvider = .t5Local
+
+        state.status = .ready
+        state.startRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if await mock.resetVADCalled { break }
+        }
+
+        recorder.lastOnSamples?([0.1])
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if !state.transcribedText.isEmpty { break }
+        }
+
+        state.stopRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if case .ready = state.status { break }
+        }
+
+        #expect(refiner.refineCalled)
+        #expect(inserter.typedTexts == ["Hello, world!"])
+        #expect(state.transcribedText == "Hello, world!")
+    }
+
+    @Test("Switching provider mid-session uses config captured at session start")
+    func switchProviderMidSession() async throws {
+        let mock = MockTranscriber()
+        await mock.setFeedAudioResult(["hello world"])
+        await mock.setFlushResult("")
+        let recorder = MockAudioRecorder()
+        let inserter = MockTextInserter()
+        let refiner = MockTextRefiner()
+        refiner.refineResult = "Hello, world!"
+        let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
+        state.refinementProvider = .claude
+
+        state.status = .ready
+        state.startRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if await mock.resetVADCalled { break }
+        }
+
+        // Switch provider to .none mid-recording — should not affect this session
+        state.refinementProvider = .none
+
+        recorder.lastOnSamples?([0.1])
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if !state.transcribedText.isEmpty { break }
+        }
+
+        state.stopRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if case .ready = state.status { break }
+        }
+
+        // Refiner should still have been called because config was captured at session start
+        #expect(refiner.refineCalled)
+        #expect(inserter.typedTexts == ["Hello, world!"])
+    }
+
+    @Test("Correct prompt and text passed to refiner")
+    func correctPromptAndTextPassedToRefiner() async throws {
+        let mock = MockTranscriber()
+        await mock.setFeedAudioResult(["hello world"])
+        await mock.setFlushResult("")
+        let recorder = MockAudioRecorder()
+        let inserter = MockTextInserter()
+        let refiner = MockTextRefiner()
+        refiner.refineResult = "refined"
+        let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
+        state.refinementProvider = .claude
+        // Use the default prompt from claudeRefineConfig
+        let expectedPrompt = state.claudeRefineConfig.prompt
+
+        state.status = .ready
+        state.startRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if await mock.resetVADCalled { break }
+        }
+
+        recorder.lastOnSamples?([0.1])
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if !state.transcribedText.isEmpty { break }
+        }
+
+        state.stopRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if case .ready = state.status { break }
+        }
+
+        #expect(refiner.refineCalled)
+        #expect(refiner.lastText == "hello world")
+        #expect(refiner.lastPrompt == expectedPrompt)
     }
 }
 

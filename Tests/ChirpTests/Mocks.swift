@@ -100,3 +100,26 @@ final class MockTextInserter: TextInserting {
         deletedCounts.append(count)
     }
 }
+
+@MainActor
+final class MockTextRefiner: TextRefining {
+    var refineResult: String = ""
+    var refineError: Error?
+    var refineCalled = false
+    var refineCallCount = 0
+    var lastText: String?
+    var lastPrompt: String?
+    var refineDelay: Duration?
+
+    func refine(text: String, systemPrompt: String) async throws -> String {
+        refineCalled = true
+        refineCallCount += 1
+        lastText = text
+        lastPrompt = systemPrompt
+        if let delay = refineDelay {
+            try await Task.sleep(for: delay)
+        }
+        if let error = refineError { throw error }
+        return refineResult
+    }
+}

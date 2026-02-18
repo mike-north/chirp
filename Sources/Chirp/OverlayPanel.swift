@@ -137,10 +137,10 @@ struct GlowBorder: View {
 struct IslandView: View {
     var appState: AppState
 
-    /// True for `.recording` or `.transcribing` — drives glow border, padding, border opacity.
+    /// True for `.recording`, `.transcribing`, or `.refining` — drives glow border, padding, border opacity.
     private var isActive: Bool {
         switch appState.status {
-        case .recording, .transcribing: return true
+        case .recording, .transcribing, .refining: return true
         default: return false
         }
     }
@@ -152,6 +152,11 @@ struct IslandView: View {
 
     private var isTranscribing: Bool {
         if case .transcribing = appState.status { return true }
+        return false
+    }
+
+    private var isRefining: Bool {
+        if case .refining = appState.status { return true }
         return false
     }
 
@@ -247,6 +252,13 @@ struct IslandView: View {
                     .padding(.top, 10)
                     .padding(.bottom, 6)
                     .transition(.opacity.combined(with: .scale(scale: 0.8)))
+            } else if isRefining {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(cPurple)
+                    .padding(.top, 12)
+                    .padding(.bottom, 6)
+                    .transition(.opacity.combined(with: .scale(scale: 0.8)))
             } else {
                 Circle()
                     .fill(cBlue.opacity(0.5))
@@ -309,7 +321,7 @@ struct IslandView: View {
                             }
                         }
                     } else {
-                        Text(isRecording ? "Listening..." : isTranscribing ? "Finalizing..." : "Ready")
+                        Text(isRecording ? "Listening..." : isTranscribing ? "Finalizing..." : isRefining ? "Refining..." : "Ready")
                             .foregroundStyle(.white.opacity(0.4))
                     }
                 }
@@ -357,7 +369,7 @@ struct IslandView: View {
             RoundedRectangle(cornerRadius: 22, style: .continuous)
                 .strokeBorder(.white.opacity((isActive || isDownloading) ? 0.03 : 0.06), lineWidth: 0.5)
         )
-        .overlay(GlowBorder(active: isActive || isDownloading, level: isDownloading ? 0.15 : isTranscribing ? 0.3 : appState.audioLevel))
+        .overlay(GlowBorder(active: isActive || isDownloading, level: isDownloading ? 0.15 : isTranscribing ? 0.3 : isRefining ? 0.3 : appState.audioLevel))
         .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .scaleEffect(appState.downloadNudge ? 1.03 : breathe)
         .shadow(color: .black.opacity(0.3), radius: 20, y: 6)

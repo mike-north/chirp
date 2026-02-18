@@ -19,18 +19,26 @@
 //     ▼                │ error  │
 //   ┌───────┐  retry   └────────┘
 //   │ ready │←────────────┘
-//   └───┬───┘←──────────────────────────────────┐
-//  fn press│                                ESC │
-//        ▼                                      │
-//   ┌───────────┐  fn release  ┌──────────────┐ │
-//   │ recording ├─────────────→│ transcribing ├─┘
-//   └─────┬─────┘  ←───────────┴──────┬───────┘
-//      ESC│         fn press          │ flush + linger
-//         └──→ ready                  └──→ ready
+//   └───┬───┘←─────────────────────────────────────────┐
+//       │  fn press                                ESC │
+//       ▼                                              │
+//   ┌───────────┐  fn release  ┌──────────────┐        │
+//   │ recording ├─────────────→│ transcribing │        │
+//   └─────┬─────┘  ←───────────┴──────┬───────┘        │
+//      ESC│         fn press          │                │
+//         │                           ▼                │
+//         │                  (if refine enabled)       │
+//         │                     ┌──────────┐           │
+//         │                     │ refining │───────────┤
+//         │                     └────┬─────┘           │
+//         │                    done  │                 │
+//         │                          ▼                 │
+//         └──→ ready ←──────── linger / done ──────────┘
 //
 // recording ↔ transcribing can cycle (fn press/release) within the
-// same session. Text accumulates across cycles. Session ends via
-// linger timeout (natural) or ESC (cancel).
+// same session. Text accumulates across cycles. If refine is enabled,
+// after flush the state transitions to .refining, then back to .ready
+// after linger. Session ends via linger timeout (natural) or ESC (cancel).
 
 import SwiftUI
 import Foundation
@@ -47,6 +55,7 @@ public final class AppState {
         case ready
         case recording
         case transcribing
+        case refining
         case error(String)
     }
 
@@ -63,6 +72,8 @@ public final class AppState {
     /// Per-variant progress for background (non-active) downloads. 0.0…1.0.
     public var backgroundDownloads: [ModelVariant: Double] = [:]
     private var backgroundManagers: [ModelVariant: ModelManager] = [:]
+    /// T5 refinement model download progress. nil = not downloading, 0.0…1.0 = in progress.
+    public var t5DownloadProgress: Double?
     public var hotkeyConfig: HotkeyConfig = .saved
     var hotkeyManager: HotkeyManager?
     var overlayPanel: OverlayPanel?
@@ -87,11 +98,51 @@ public final class AppState {
     /// Peek previews that were started before the latest commit are discarded.
     private var commitGen = 0
 
+    public var refinementProvider: RefinementProvider = .saved
+    public var claudeRefineConfig = ClaudeRefineConfig()
+    public var t5TextPrefix: String {
+        get { UserDefaults.standard.string(forKey: "t5TextPrefix") ?? "grammar" }
+        set { UserDefaults.standard.set(newValue, forKey: "t5TextPrefix") }
+    }
+    public var textRefiner: (any TextRefining)?
+    public var daemonManager: DaemonManager?
+    var t5ModelManager: T5ModelManager?
+    var t5Refiner: T5OnnxRefiner?
+    public var t5Loading: Bool = false
+    public var t5DownloadError: String?
+
     public convenience init() {
         self.init(audioRecorder: AudioRecorder(), transcriber: Transcriber(), textInserter: TextInserter())
         self.modelFileCheck = { [weak self] in
             guard let self else { return false }
             return ModelManager.findExisting(variant: self.activeVariant) != nil
+        }
+        let dm = DaemonManager()
+        self.daemonManager = dm
+
+        switch refinementProvider {
+        case .claude:
+            self.textRefiner = ClaudeTextRefiner()
+            dm.start()
+        case .t5Local:
+            if let paths = T5ModelManager.findExisting() {
+                t5Loading = true
+                Task { [weak self] in
+                    defer { self?.t5Loading = false }
+                    do {
+                        let refiner = try await T5OnnxRefiner(paths: paths)
+                        self?.t5Refiner = refiner
+                        self?.textRefiner = refiner
+                        NSLog("Chirp: T5OnnxRefiner initialized successfully")
+                    } catch {
+                        NSLog("Chirp: T5OnnxRefiner init failed: \(error)")
+                    }
+                }
+            } else {
+                NSLog("Chirp: T5 model not downloaded yet")
+            }
+        case .none:
+            break
         }
     }
 
@@ -273,6 +324,78 @@ public final class AppState {
         manager.download()
     }
 
+    // MARK: - Refinement provider switching
+
+    public func switchRefinementProvider(to provider: RefinementProvider) {
+        refinementProvider = provider
+        RefinementProvider.saved = provider
+        switch provider {
+        case .claude:
+            daemonManager?.start()
+            textRefiner = ClaudeTextRefiner()
+        case .t5Local:
+            daemonManager?.stop()
+            textRefiner = t5Refiner  // nil if not yet downloaded/loaded
+        case .none:
+            daemonManager?.stop()
+            textRefiner = nil
+        }
+    }
+
+    // MARK: - T5 model
+
+    public func isT5ModelDownloaded() -> Bool {
+        T5ModelManager.findExisting() != nil
+    }
+
+    public func downloadT5Model() {
+        guard t5ModelManager == nil else { return }
+        t5DownloadError = nil
+        t5DownloadProgress = 0
+        t5ModelManager = T5ModelManager(
+            onProgress: { [weak self] progress in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated { self?.t5DownloadProgress = progress }
+                }
+            },
+            onComplete: { [weak self] result in
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        self?.t5DownloadProgress = nil
+                        self?.t5ModelManager = nil
+                        switch result {
+                        case .success(let paths):
+                            self?.modelCacheGeneration += 1
+                            NSLog("Chirp: T5 model downloaded to \(paths.tokenizerDir)")
+                            Task { [weak self] in
+                                do {
+                                    let refiner = try await T5OnnxRefiner(paths: paths)
+                                    self?.t5Refiner = refiner
+                                    if self?.refinementProvider == .t5Local {
+                                        self?.textRefiner = refiner
+                                    }
+                                    NSLog("Chirp: T5OnnxRefiner ready after download")
+                                } catch {
+                                    NSLog("Chirp: T5OnnxRefiner init failed after download: \(error)")
+                                }
+                            }
+                        case .failure(let error):
+                            self?.t5DownloadError = error.localizedDescription
+                            NSLog("Chirp: T5 model download failed: \(error)")
+                        }
+                    }
+                }
+            }
+        )
+        t5ModelManager?.download()
+    }
+
+    public func cancelT5Download() {
+        t5ModelManager?.cancel()
+        t5ModelManager = nil
+        t5DownloadProgress = nil
+    }
+
     // MARK: - Hotkey
 
     public func updateHotkey(_ config: HotkeyConfig) {
@@ -365,6 +488,12 @@ public final class AppState {
         }
 
         let transcriber = self.transcriber
+        // Capture config at session start so it stays consistent throughout
+        // the consumer task (also avoids re-reading UserDefaults mid-session).
+        let refineEnabled = self.refinementProvider != .none
+        let refinePrompt = self.refinementProvider == .t5Local
+            ? self.t5TextPrefix
+            : self.claudeRefineConfig.prompt
         audioConsumerTask = Task { [weak self] in
             // Guaranteed to run before first feedAudio — no ordering race.
             await transcriber.resetVAD()
@@ -391,7 +520,9 @@ public final class AppState {
                     let needsSpace = !self.transcribedText.isEmpty
                     if needsSpace { self.transcribedText += " " }
                     self.transcribedText += text
-                    self.textInserter.typeText(needsSpace ? " \(text)" : text)
+                    if !refineEnabled {
+                        self.textInserter.typeText(needsSpace ? " \(text)" : text)
+                    }
                 }
             }
 
@@ -408,10 +539,51 @@ public final class AppState {
                 let needsSpace = !self.transcribedText.isEmpty
                 if needsSpace { self.transcribedText += " " }
                 self.transcribedText += remaining
-                self.textInserter.typeText(needsSpace ? " \(remaining)" : remaining)
+                if !refineEnabled {
+                    self.textInserter.typeText(needsSpace ? " \(remaining)" : remaining)
+                }
             }
             self.audioLevel = 0
             self.hotkeyManager?.sessionActive = false
+
+            // Refinement flow: if enabled, send accumulated text to Claude for cleanup
+            // before typing it out. Falls back to raw text if refiner unavailable or throws.
+            // If T5 is still loading, wait briefly for it to finish.
+            if refineEnabled && self.refinementProvider == .t5Local && self.t5Loading {
+                for _ in 0..<10 {
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    guard !Task.isCancelled else { return }
+                    guard self.recordingSession == session else { return }
+                    if !self.t5Loading { break }
+                }
+            }
+
+            if refineEnabled && !self.transcribedText.isEmpty,
+               let refiner = self.textRefiner {
+                self.status = .refining
+                do {
+                    let refined = try await refiner.refine(
+                        text: self.transcribedText,
+                        systemPrompt: refinePrompt
+                    )
+                    guard !Task.isCancelled else { return }
+                    guard self.recordingSession == session else { return }
+                    if refined.isEmpty {
+                        self.textInserter.typeText(self.transcribedText)
+                    } else {
+                        self.textInserter.typeText(refined)
+                        self.transcribedText = refined
+                    }
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    guard self.recordingSession == session else { return }
+                    self.textInserter.typeText(self.transcribedText)
+                }
+            } else if refineEnabled && !self.transcribedText.isEmpty {
+                // Refiner not available — fall back to raw text
+                self.textInserter.typeText(self.transcribedText)
+            }
+
             if !self.transcribedText.isEmpty {
                 try? await Task.sleep(nanoseconds: self.lingerDuration)
                 guard !Task.isCancelled else { return }
@@ -461,7 +633,7 @@ public final class AppState {
 
     func cancelSession() {
         switch status {
-        case .recording, .transcribing: break
+        case .recording, .transcribing, .refining: break
         default: return
         }
 

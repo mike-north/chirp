@@ -10,3 +10,6 @@ dist/
 Sources/CSherpaOnnx/include/c-api.h
 bazel-*
 MODULE.bazel.lock
+chirp-daemon/node_modules/
+chirp-daemon/dist/
+.claude/settings.local.json
