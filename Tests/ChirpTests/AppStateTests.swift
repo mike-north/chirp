@@ -24,7 +24,7 @@ struct AppStateTests {
         // Reset UserDefaults-backed config to prevent cross-test pollution.
         // Config is captured at startRecording() time, so tests that need
         // enabled=true can set it after makeAppState returns.
-        state.claudeRefineConfig.enabled = false
+        state.refinementProvider = .none
         if let refiner {
             state.textRefiner = refiner
         }
@@ -1201,7 +1201,7 @@ struct AppStateTests {
         let refiner = MockTextRefiner()
         refiner.refineResult = "Hello, world!"
         let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
-        state.claudeRefineConfig.enabled = true
+        state.refinementProvider = .claude
 
         state.status = .ready
         state.startRecording()
@@ -1239,7 +1239,7 @@ struct AppStateTests {
         let refiner = MockTextRefiner()
         refiner.refineError = RefineError.connectionFailed(errno: 61)
         let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
-        state.claudeRefineConfig.enabled = true
+        state.refinementProvider = .claude
 
         state.status = .ready
         state.startRecording()
@@ -1276,7 +1276,7 @@ struct AppStateTests {
         let inserter = MockTextInserter()
         let refiner = MockTextRefiner()
         let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
-        state.claudeRefineConfig.enabled = false
+        state.refinementProvider = .none
 
         state.status = .ready
         state.startRecording()
@@ -1314,7 +1314,7 @@ struct AppStateTests {
         refiner.refineResult = "refined"
         refiner.refineDelay = .seconds(5)
         let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
-        state.claudeRefineConfig.enabled = true
+        state.refinementProvider = .claude
 
         state.status = .ready
         state.startRecording()
@@ -1358,7 +1358,7 @@ struct AppStateTests {
         let refiner = MockTextRefiner()
         refiner.refineResult = "should not appear"
         let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
-        state.claudeRefineConfig.enabled = true
+        state.refinementProvider = .claude
 
         state.status = .ready
         state.startRecording()
@@ -1389,7 +1389,7 @@ struct AppStateTests {
         let refiner = MockTextRefiner()
         refiner.refineResult = ""
         let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
-        state.claudeRefineConfig.enabled = true
+        state.refinementProvider = .claude
 
         state.status = .ready
         state.startRecording()
@@ -1426,7 +1426,7 @@ struct AppStateTests {
         let inserter = MockTextInserter()
         // No refiner passed — remains nil
         let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter)
-        state.claudeRefineConfig.enabled = true
+        state.refinementProvider = .claude
 
         state.status = .ready
         state.startRecording()
@@ -1452,6 +1452,85 @@ struct AppStateTests {
         #expect(inserter.typedTexts == ["hello"])
     }
 
+    @Test("T5 provider enabled + success types only refined text")
+    func t5ProviderSuccess() async throws {
+        let mock = MockTranscriber()
+        await mock.setFeedAudioResult(["hello world"])
+        await mock.setFlushResult("")
+        let recorder = MockAudioRecorder()
+        let inserter = MockTextInserter()
+        let refiner = MockTextRefiner()
+        refiner.refineResult = "Hello, world!"
+        let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
+        state.refinementProvider = .t5Local
+
+        state.status = .ready
+        state.startRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if await mock.resetVADCalled { break }
+        }
+
+        recorder.lastOnSamples?([0.1])
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if !state.transcribedText.isEmpty { break }
+        }
+
+        state.stopRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if case .ready = state.status { break }
+        }
+
+        #expect(refiner.refineCalled)
+        #expect(inserter.typedTexts == ["Hello, world!"])
+        #expect(state.transcribedText == "Hello, world!")
+    }
+
+    @Test("Switching provider mid-session uses config captured at session start")
+    func switchProviderMidSession() async throws {
+        let mock = MockTranscriber()
+        await mock.setFeedAudioResult(["hello world"])
+        await mock.setFlushResult("")
+        let recorder = MockAudioRecorder()
+        let inserter = MockTextInserter()
+        let refiner = MockTextRefiner()
+        refiner.refineResult = "Hello, world!"
+        let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
+        state.refinementProvider = .claude
+
+        state.status = .ready
+        state.startRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if await mock.resetVADCalled { break }
+        }
+
+        // Switch provider to .none mid-recording — should not affect this session
+        state.refinementProvider = .none
+
+        recorder.lastOnSamples?([0.1])
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if !state.transcribedText.isEmpty { break }
+        }
+
+        state.stopRecording()
+
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            if case .ready = state.status { break }
+        }
+
+        // Refiner should still have been called because config was captured at session start
+        #expect(refiner.refineCalled)
+        #expect(inserter.typedTexts == ["Hello, world!"])
+    }
+
     @Test("Correct prompt and text passed to refiner")
     func correctPromptAndTextPassedToRefiner() async throws {
         let mock = MockTranscriber()
@@ -1462,7 +1541,7 @@ struct AppStateTests {
         let refiner = MockTextRefiner()
         refiner.refineResult = "refined"
         let (state, _, _, _) = makeAppState(transcriber: mock, recorder: recorder, inserter: inserter, refiner: refiner)
-        state.claudeRefineConfig.enabled = true
+        state.refinementProvider = .claude
         // Use the default prompt from claudeRefineConfig
         let expectedPrompt = state.claudeRefineConfig.prompt
 

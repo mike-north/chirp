@@ -27,7 +27,7 @@ struct ChirpApp: App {
             VStack(spacing: 0) {
                 modelSection
                 hotkeySection
-                claudeSection
+                refinementSection
                 CheckForUpdatesView(updater: updaterController.updater)
 
                 SectionDivider()
@@ -203,37 +203,160 @@ struct ChirpApp: App {
         }
     }
 
-    // MARK: - Claude Refinement Section
+    // MARK: - Text Refinement Section
 
     @State private var showPromptEditor = false
+    @State private var showT5PrefixEditor = false
 
     @ViewBuilder
-    private var claudeSection: some View {
-        Text("Claude Refinement")
+    private var refinementSection: some View {
+        Text("Text Refinement")
             .font(.system(size: 13, weight: .medium))
             .foregroundColor(.white.opacity(0.7))
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
 
-        Toggle(isOn: claudeEnabledBinding) {
-            Text("Refine with Claude")
-                .font(.system(size: 13))
-                .foregroundColor(.white.opacity(0.7))
-        }
-        .toggleStyle(.switch)
-        .controlSize(.small)
+        CompactPicker(
+            selection: refinementProviderBinding,
+            options: RefinementProvider.allCases.map { ($0, $0.displayName) }
+        )
         .padding(.horizontal, 12)
-        .padding(.vertical, 4)
+        .padding(.vertical, 2)
 
-        if appState.claudeRefineConfig.enabled {
-            // Model picker
-            Picker("Model", selection: claudeModelBinding) {
-                Text("Sonnet 4.5").tag("claude-sonnet-4-5-20250929")
-                Text("Haiku 4.5").tag("claude-haiku-4-5-20251001")
+        switch appState.refinementProvider {
+        case .none:
+            EmptyView()
+        case .t5Local:
+            if appState.isT5ModelDownloaded() {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(.green)
+                        .frame(width: 6, height: 6)
+                    Text("Flan-T5-Small model ready")
+                        .font(.system(size: 10))
+                        .foregroundColor(.white.opacity(0.35))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
+
+                // Edit prefix button
+                Button {
+                    showT5PrefixEditor.toggle()
+                } label: {
+                    HStack {
+                        Text("Text Prefix\u{2026}")
+                            .font(.system(size: 11))
+                            .foregroundColor(.white.opacity(0.5))
+                        Spacer()
+                        Text(appState.t5TextPrefix.isEmpty ? "(none)" : appState.t5TextPrefix)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.3))
+                            .lineLimit(1)
+                    }
+                    .contentShape(Rectangle())
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 4)
+                }
+                .buttonStyle(MenuRowStyle())
+
+                if showT5PrefixEditor {
+                    HStack(spacing: 4) {
+                        TextField("e.g. grammar, paraphrase", text: t5PrefixBinding)
+                            .font(.system(size: 10, design: .monospaced))
+                            .textFieldStyle(.plain)
+                            .onSubmit { showT5PrefixEditor = false }
+                        Button {
+                            showT5PrefixEditor = false
+                        } label: {
+                            Text("Done")
+                                .font(.system(size: 9, weight: .medium))
+                                .foregroundColor(cBlue)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(.white.opacity(0.06))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(.white.opacity(0.1), lineWidth: 0.5)
+                    )
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 4)
+                }
+            } else if let progress = appState.t5DownloadProgress {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .scaleEffect(0.6)
+                    if progress < 0.9 {
+                        Text("Downloading\u{2026} \(Int(progress * 100))%")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.35))
+                    } else {
+                        Text("Preparing\u{2026}")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.35))
+                    }
+                    Spacer()
+                    Button("Cancel") {
+                        appState.cancelT5Download()
+                    }
+                    .font(.system(size: 10))
+                    .foregroundColor(.white.opacity(0.4))
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
+            } else {
+                Button {
+                    appState.downloadT5Model()
+                } label: {
+                    HStack {
+                        Text("Download Flan-T5-Small (~152 MB)")
+                            .font(.system(size: 11))
+                            .foregroundColor(cCyan)
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 4)
+                }
+                .buttonStyle(MenuRowStyle())
+
+                if let errorMsg = appState.t5DownloadError {
+                    Text(errorMsg)
+                        .font(.system(size: 9))
+                        .foregroundColor(Color(red: 0.95, green: 0.30, blue: 0.30))
+                        .lineLimit(2)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 2)
+                        .padding(.bottom, 4)
+                }
             }
-            .pickerStyle(.menu)
-            .font(.system(size: 11))
+        case .claude:
+            // Model picker — grouped by tier
+            VStack(spacing: 3) {
+                CompactPickerRow(
+                    label: "Sonnet",
+                    selection: claudeModelBinding,
+                    options: [
+                        ("claude-sonnet-4-5-latest", "4.5"),
+                        ("claude-sonnet-4-6-latest", "4.6"),
+                    ]
+                )
+                CompactPickerRow(
+                    label: "Haiku",
+                    selection: claudeModelBinding,
+                    options: [
+                        ("claude-haiku-4-5-latest", "4.5"),
+                        ("claude-haiku-4-6-latest", "4.6"),
+                    ]
+                )
+            }
             .padding(.horizontal, 12)
             .padding(.vertical, 2)
 
@@ -286,17 +409,19 @@ struct ChirpApp: App {
         SectionDivider()
     }
 
-    private var claudeEnabledBinding: Binding<Bool> {
+    private var refinementProviderBinding: Binding<RefinementProvider> {
         Binding(
-            get: { appState.claudeRefineConfig.enabled },
+            get: { appState.refinementProvider },
             set: { newValue in
-                appState.claudeRefineConfig.enabled = newValue
-                if newValue {
-                    appState.daemonManager?.start()
-                } else {
-                    appState.daemonManager?.stop()
-                }
+                appState.switchRefinementProvider(to: newValue)
             }
+        )
+    }
+
+    private var t5PrefixBinding: Binding<String> {
+        Binding(
+            get: { appState.t5TextPrefix },
+            set: { appState.t5TextPrefix = $0 }
         )
     }
 
@@ -410,6 +535,77 @@ struct ChirpApp: App {
 }
 
 // MARK: - Shared Components
+
+private struct CompactPicker<T: Hashable>: View {
+    @Binding var selection: T
+    let options: [(value: T, label: String)]
+
+    var body: some View {
+        HStack(spacing: 1) {
+            ForEach(Array(options.enumerated()), id: \.offset) { _, option in
+                let isSelected = selection == option.value
+                Button {
+                    selection = option.value
+                } label: {
+                    Text(option.label)
+                        .font(.system(size: 10, weight: isSelected ? .medium : .regular))
+                        .foregroundColor(isSelected ? .white.opacity(0.9) : .white.opacity(0.4))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .frame(maxWidth: .infinity)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .fill(isSelected ? cBlue.opacity(0.25) : Color.clear)
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(2)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(.white.opacity(0.04))
+        )
+    }
+}
+
+private struct CompactPickerRow<T: Hashable>: View {
+    let label: String
+    @Binding var selection: T
+    let options: [(value: T, label: String)]
+
+    var body: some View {
+        let tierSelected = options.contains { $0.value == selection }
+        HStack(spacing: 4) {
+            Text(label)
+                .font(.system(size: 10, weight: tierSelected ? .medium : .regular))
+                .foregroundColor(tierSelected ? .white.opacity(0.7) : .white.opacity(0.35))
+                .frame(width: 44, alignment: .leading)
+            HStack(spacing: 1) {
+                ForEach(Array(options.enumerated()), id: \.offset) { _, option in
+                    let isSelected = selection == option.value
+                    Button {
+                        selection = option.value
+                    } label: {
+                        Text(option.label)
+                            .font(.system(size: 10, weight: isSelected ? .medium : .regular))
+                            .foregroundColor(isSelected ? .white.opacity(0.9) : .white.opacity(0.4))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .frame(maxWidth: .infinity)
+                            .background(
+                                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                    .fill(isSelected ? cBlue.opacity(0.25) : Color.clear)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(.horizontal, 4)
+        .padding(.vertical, 1)
+    }
+}
 
 private struct SectionDivider: View {
     var body: some View {

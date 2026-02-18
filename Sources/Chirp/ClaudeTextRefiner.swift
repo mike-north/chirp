@@ -5,11 +5,6 @@
 import Foundation
 
 public struct ClaudeRefineConfig: Sendable {
-    public var enabled: Bool {
-        get { UserDefaults.standard.bool(forKey: "claudeRefineEnabled") }
-        set { UserDefaults.standard.set(newValue, forKey: "claudeRefineEnabled") }
-    }
-
     public var prompt: String {
         get {
             UserDefaults.standard.string(forKey: "claudeRefinePrompt")
@@ -30,7 +25,7 @@ public struct ClaudeRefineConfig: Sendable {
 
     public var model: String {
         get {
-            UserDefaults.standard.string(forKey: "claudeRefineModel") ?? "claude-sonnet-4-5-20250929"
+            UserDefaults.standard.string(forKey: "claudeRefineModel") ?? "claude-sonnet-4-6-latest"
         }
         set { UserDefaults.standard.set(newValue, forKey: "claudeRefineModel") }
     }
@@ -38,17 +33,17 @@ public struct ClaudeRefineConfig: Sendable {
 
 @MainActor
 final class ClaudeTextRefiner: TextRefining {
-    private let socketPath = "/tmp/chirp-claude.sock"
+    private let socketPath = NSTemporaryDirectory() + "chirp-claude.sock"
     private let timeout: TimeInterval = 30
 
     /// Sends transcribed text to the Claude daemon for grammar/punctuation cleanup.
     /// - Parameters:
     ///   - text: Raw transcribed text from the speech recognizer.
     ///   - systemPrompt: System prompt instructing Claude how to refine the text.
-    ///   - model: Claude model ID (default: claude-sonnet-4-5-20250929).
+    ///   - model: Claude model ID (default: claude-sonnet-4-6-latest).
     /// - Returns: Refined text with corrected grammar, punctuation, and removed filler words.
     /// - Throws: `RefineError` if socket connection, communication, or parsing fails.
-    func refine(text: String, systemPrompt: String, model: String = "claude-sonnet-4-5-20250929") async throws -> String {
+    func refine(text: String, systemPrompt: String, model: String = "claude-sonnet-4-6-latest") async throws -> String {
         let request: [String: Any] = [
             "action": "refine",
             "model": model,

@@ -16,7 +16,13 @@ public final class DaemonManager {
     private var stopped = false
     private var restartCount = 0
     private let maxBackoff: TimeInterval = 30
-    private let socketPath = "/tmp/chirp-claude.sock"
+    private let socketPath = NSTemporaryDirectory() + "chirp-claude.sock"
+    private var nodePath: String?
+
+    private static let commonNodePaths = [
+        "/opt/homebrew/bin/node",
+        "/usr/local/bin/node",
+    ]
 
     /// Path to the daemon script (index.js).
     private let scriptPath: String
@@ -50,7 +56,9 @@ public final class DaemonManager {
             forName: NSApplication.willTerminateNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
-            self?.process?.terminate()
+            MainActor.assumeIsolated {
+                self?.process?.terminate()
+            }
         }
     }
 
@@ -77,18 +85,51 @@ public final class DaemonManager {
     // MARK: - Private
 
     private func checkNodeAvailable() {
+        // First try `which node` (works when PATH is set, e.g. terminal launches).
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/which")
         proc.arguments = ["node"]
-        proc.standardOutput = Pipe()
+        let pipe = Pipe()
+        proc.standardOutput = pipe
         proc.standardError = Pipe()
         do {
             try proc.run()
             proc.waitUntilExit()
-            nodeAvailable = proc.terminationStatus == 0
+            if proc.terminationStatus == 0,
+               let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                   .trimmingCharacters(in: .whitespacesAndNewlines),
+               !output.isEmpty {
+                nodePath = output
+                nodeAvailable = true
+                return
+            }
         } catch {
-            nodeAvailable = false
+            // Fall through to manual search.
         }
+
+        // GUI apps have a minimal PATH. Check common install locations.
+        var candidates = Self.commonNodePaths
+
+        // Check nvm installations.
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let nvmVersions = home + "/.nvm/versions/node"
+        if let versions = try? FileManager.default.contentsOfDirectory(atPath: nvmVersions) {
+            // Sort descending so we pick the latest version.
+            let sorted = versions.sorted { $0.compare($1, options: .numeric) == .orderedDescending }
+            for version in sorted {
+                candidates.append(nvmVersions + "/" + version + "/bin/node")
+            }
+        }
+
+        for path in candidates {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                nodePath = path
+                nodeAvailable = true
+                return
+            }
+        }
+
+        nodeAvailable = false
     }
 
     private func spawnDaemon() {
@@ -97,8 +138,13 @@ public final class DaemonManager {
         NSLog("[DaemonManager] Spawning daemon at: %@", scriptPath)
 
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        proc.arguments = ["node", scriptPath]
+        if let nodePath {
+            proc.executableURL = URL(fileURLWithPath: nodePath)
+            proc.arguments = [scriptPath]
+        } else {
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            proc.arguments = ["node", scriptPath]
+        }
         proc.environment = ProcessInfo.processInfo.environment
         let errPipe = Pipe()
         proc.standardError = errPipe

@@ -10,12 +10,16 @@ let package = Package(
     products: [
         .library(name: "Chirp", targets: ["Chirp"]),
     ],
-    dependencies: [],
+    dependencies: [
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "0.1.14"),
+    ],
     targets: [
         .target(
             name: "Chirp",
             dependencies: [
                 "CSherpaOnnx",
+                "COnnxRuntime",
+                .product(name: "Transformers", package: "swift-transformers"),
             ],
             path: "Sources/Chirp",
             exclude: ["Info.plist", "Chirp.entitlements", "Main.swift"],
@@ -44,6 +48,11 @@ let package = Package(
         .target(
             name: "CSherpaOnnx",
             path: "Sources/CSherpaOnnx",
+            publicHeadersPath: "include"
+        ),
+        .target(
+            name: "COnnxRuntime",
+            path: "Sources/COnnxRuntime",
             publicHeadersPath: "include"
         ),
     ]

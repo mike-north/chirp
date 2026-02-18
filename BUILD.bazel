@@ -36,6 +36,21 @@ sh_test(
 
 # --- Chirp Swift library (no @main, testable) ---
 
+# COnnxRuntime — exposes onnxruntime C API headers to Swift
+swift_interop_hint(
+    name = "COnnxRuntime_interop",
+    module_name = "COnnxRuntime",
+)
+
+cc_library(
+    name = "COnnxRuntime",
+    hdrs = glob(["Sources/COnnxRuntime/include/*.h"]),
+    srcs = ["Sources/COnnxRuntime/shim.c"],
+    strip_include_prefix = "Sources/COnnxRuntime/include",
+    deps = ["@sherpa_onnx//:onnxruntime"],
+    aspect_hints = [":COnnxRuntime_interop"],
+)
+
 swift_library(
     name = "ChirpLib",
     srcs = glob(
@@ -43,7 +58,11 @@ swift_library(
         exclude = ["Sources/Chirp/Main.swift"],
     ),
     module_name = "Chirp",
-    deps = ["@sherpa_onnx//:CSherpaOnnx"],
+    deps = [
+        "@sherpa_onnx//:CSherpaOnnx",
+        ":COnnxRuntime",
+        "@swiftpkg_swift_transformers//:Transformers",
+    ],
     copts = [
         "-swift-version", "6",
     ],
@@ -128,6 +147,20 @@ swift_test(
 swift_test(
     name = "AudioDuckerTests",
     srcs = ["Tests/ChirpTests/AudioDuckerTests.swift"],
+    deps = [":ChirpLib"],
+    copts = ["-swift-version", "6"],
+)
+
+swift_test(
+    name = "DaemonManagerTests",
+    srcs = ["Tests/ChirpTests/DaemonManagerTests.swift"],
+    deps = [":ChirpLib"],
+    copts = ["-swift-version", "6"],
+)
+
+swift_test(
+    name = "T5OnnxRefinerTests",
+    srcs = ["Tests/ChirpTests/T5OnnxRefinerTests.swift"],
     deps = [":ChirpLib"],
     copts = ["-swift-version", "6"],
 )
